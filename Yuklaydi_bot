@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Telegram bot (Flask webhook) — Render (Docker/Python) va Lokal sinovlar uchun moslangan.
+"""
+
+import os
+import logging
+import sqlite3
+import time
+from typing import List, Optional, Tuple, Any
+
+from flask import Flask, request
+import telebot
+from telebot import types
+import yt_dlp
+
+# ========== Konfiguratsiya ==========
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN muhit o'zgaruvchisi aniqlanmagan!")
+
+ADMINS = []
+adm_env = os.getenv("ADMINS", "")
+if adm_env:
+    try:
+        ADMINS = [int(x.strip()) for x in adm_env.split(",") if x.strip()]
+    except Exception:
+        ADMINS = []
+
+LIMIT_STANDARD = int(os.getenv("LIMIT_STANDARD", 100 * 1024 * 1024))  # 100MB
+LIMIT_VIP = int(os.getenv("LIMIT_VIP", 200 * 1024 * 1024))            # 200MB
+
+DATABASE_PATH = os.getenv("DATABASE_PATH", "bot_base.db")
+DOWNLOADS_DIR = os.getenv("DOWNLOADS_DIR", "downloads")
+EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")  # Render beradigan URL
+PORT = int(os.getenv("PORT", 5000))
+
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+# ========== Logging ==========
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("telegram-bot")
+
+# ========== Bot va Flask ==========
+bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
+
+admin_states = {}
+
+# ========== DB helper ==========
+def get_conn() -> sqlite3.Connection:
+    return sqlite3.connect(DATABASE_PATH, timeout=10, check_same_thread=False)
+
+def init_db():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id TEXT PRIMARY KEY,
+                channel_type TEXT
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+def add_user(user_id: int) -> None:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_stats() -> int:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+def get_all_users() -> List[int]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users")
+        return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+def add_channel_db(channel_id: str, channel_type: str) -> None:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT OR REPLACE INTO channels (channel_id, channel_type) VALUES (?, ?)", (channel_id, channel_type))
+        conn.commit()
+    finally:
+        conn.close()
+
+def delete_channel_db(channel_id: str) -> None:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_channels_db(channel_type: Optional[str] = None) -> List[Tuple[Any, ...]]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        if channel_type:
+            cur.execute("SELECT channel_id FROM channels WHERE channel_type = ?", (channel_type,))
+        else:
+            cur.execute("SELECT channel_id, channel_type FROM channels")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+init_db()
+
+# ========== yt_dlp yordamchilari ==========
+def safe_yt_opts(is_audio: bool, format_id: Optional[str] = None):
+    base_out = os.path.join(DOWNLOADS_DIR, "%(id)s.%(ext)s")
+    if is_audio:
+        return {
+            "format": "bestaudio/best",
+            "outtmpl": base_out,
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+            "quiet": True,
+            "noplaylist": True,
+            "no_warnings": True,
+        }
+    else:
+        fmt = f"bestvideo[height<={format_id}]+bestaudio/best[height<={format_id}]/best" if format_id and format_id.isdigit() else "best"
+        return {
+            "format": fmt,
+            "outtmpl": base_out,
+            "quiet": True,
+            "noplaylist": True,
+            "no_warnings": True,
+        }
+
+def search_music(query: str, limit: int = 10):
+    opts = {"extract_flat": True, "skip_download": True, "quiet": True, "no_warnings": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            results = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            entries = results.get("entries") or []
+            tracks = []
+            for e in entries:
+                tracks.append({"id": e.get("id"), "title": (e.get("title") or "Noma'lum")[:60]})
+            return tracks
+    except Exception:
+        logger.exception("search_music xatolik")
+        return []
+
+def download_media(url_or_id: str, is_audio: bool = False, format_id: Optional[str] = None) -> Tuple[str, int]:
+    opts = safe_yt_opts(is_audio=is_audio, format_id=format_id)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url_or_id, download=True)
+            filename = ydl.prepare_filename(info)
+            if is_audio:
+                filename = os.path.splitext(filename)[0] + ".mp3"
+            size = info.get("filesize") or info.get("filesize_approx") or 0
+            try:
+                size = int(size)
+            except Exception:
+                size = 0
+            return filename, size
+    except Exception:
+        logger.exception("download_media xatolik: %s", url_or_id)
+        raise
+
+# ========== yordamchi funktsiyalar ==========
+def is_user_subscribed(user_id: int, channel_type: str = "standard") -> bool:
+    channels = get_channels_db(channel_type)
+    if not channels:
+        return True
+    for row in channels:
+        ch_id = row[0]
+        try:
+            member = bot.get_chat_member(ch_id, user_id)
+            if member.status in ["left", "kicked"]:
+                return False
+        except Exception:
+            logger.warning("is_user_subscribed: kanalni tekshirishda xatolik: %s", ch_id)
+            return False
+    return True
+
+# ========== Bot handlers ==========
+@bot.message_handler(commands=["start"])
+def start_cmd(message: types.Message):
+    add_user(message.from_user.id)
+    bot.send_message(message.chat.id, "👋 Salom! Video havola yoki musiqa nomini yuboring.")
+
+@bot.message_handler(commands=["admin"])
+def admin_cmd(message: types.Message):
+    if message.from_user.id not in ADMINS:
+        bot.reply_to(message, "Siz admin emassiz.")
+        return
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("📊 Statistika", "📢 Reklama yuborish")
+    markup.add("➕ Kanal qo'shish", "🗑 Kanal o'chirish")
+    markup.add("📋 Kanallar ro'yxati")
+    bot.send_message(message.chat.id, "🛠 Admin panel:", reply_markup=markup)
+
+@bot.message_handler(func=lambda msg: msg.text == "📊 Statistika")
+def stats_handler(message: types.Message):
+    if message.from_user.id not in ADMINS:
+        return
+    total = get_stats()
+    bot.send_message(message.chat.id, f"📊 Jami foydalanuvchilar: {total} ta")
+
+@bot.message_handler(func=lambda msg: msg.text == "📋 Kanallar ro'yxati")
+def list_channels_handler(message: types.Message):
+    if message.from_user.id not in ADMINS:
+        return
+    channels = get_channels_db()
+    if not channels:
+        bot.send_message(message.chat.id, "Hozircha kanal yo'q.")
+        return
+    text = "📋 Kanallar ro'yxati:\n\n"
+    for ch_id, ch_type in channels:
+        text += f"• `{ch_id}` — {ch_type.upper()}\n"
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda msg: msg.text == "➕ Kanal qo'shish")
+def add_channel_start(message: types.Message):
+    if message.from_user.id not in ADMINS:
+        return
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("Oddiy kanal (100MB)", callback_data="add_ch_type|standard"),
+        types.InlineKeyboardButton("VIP kanal (200MB)", callback_data="add_ch_type|vip")
+    )
+    bot.send_message(message.chat.id, "Kanal turini tanlang:", reply_markup=markup)
+
+@bot.message_handler(func=lambda msg: msg.text == "🗑 Kanal o'chirish")
+def del_channel_start(message: types.Message):
+    if message.from_user.id not in ADMINS:
+        return
+    channels = get_channels_db()
+    if not channels:
+        bot.send_message(message.chat.id, "O'chirish uchun kanal yo'q.")
+        return
+    markup = types.InlineKeyboardMarkup()
+    for ch_id, ch_type in channels:
+        markup.add(types.InlineKeyboardButton(f"❌ {ch_id} ({ch_type})", callback_data=f"del_ch|{ch_id}"))
+    bot.send_message(message.chat.id, "O'chirmoqchi bo'lgan kanalingizni tanlang:", reply_markup=markup)
+
+@bot.message_handler(func=lambda msg: msg.text == "📢 Reklama yuborish")
+def start_broadcast(message: types.Message):
+    if message.from_user.id not in ADMINS:
+        return
+    admin_states[message.from_user.id] = "WAITING_FOR_REKLAMA"
+    bot.send_message(message.chat.id, "Reklama matnini yuboring:")
+
+@bot.message_handler(func=lambda msg: admin_states.get(msg.from_user.id) in ["WAITING_FOR_REKLAMA", "WAITING_FOR_CHANNEL_standard", "WAITING_FOR_CHANNEL_vip"])
+def handle_admin_inputs(message: types.Message):
+    user_id = message.from_user.id
+    state = admin_states.get(user_id)
+    if state == "WAITING_FOR_REKLAMA":
+        admin_states[user_id] = None
+        users = get_all_users()
+        success = failed = 0
+        bot.send_message(message.chat.id, f"Reklama {len(users)} ta odamga yuborilmoqda...")
+        for uid in users:
+            try:
+                bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
+                success += 1
+                time.sleep(0.05)
+            except Exception:
+                failed += 1
+        bot.send_message(message.chat.id, f"✅ Yuborildi: {success}\n❌ Muvaffaqiyatsiz: {failed}")
+    elif state and state.startswith("WAITING_FOR_CHANNEL_"):
+        ch_type = state.replace("WAITING_FOR_CHANNEL_", "")
+        ch_id = (message.text or "").strip()
+        if not ch_id:
+            bot.send_message(message.chat.id, "Iltimos kanal username'ini yuboring (masalan @kanal_username).")
+            return
+        add_channel_db(ch_id, ch_type)
+        admin_states[user_id] = None
+        bot.send_message(message.chat.id, f"✅ `{ch_id}` kanali qo'shildi!", parse_mode="Markdown")
+
+@bot.message_handler(func=lambda msg: True, content_types=["text"])
+def handle_text(message: types.Message):
+    user_id = message.from_user.id
+    add_user(user_id)
+
+    if not is_user_subscribed(user_id, "standard"):
+        channels = get_channels_db("standard")
+        if channels:
+            markup = types.InlineKeyboardMarkup()
+            for row in channels:
+                ch = row[0]
+                link = f"https://t.me/{ch.lstrip('@')}"
+                markup.add(types.InlineKeyboardButton(text="Kanalga a'zo bo'lish ➕", url=link))
+            bot.send_message(message.chat.id, "Kanalga obuna bo'ling:", reply_markup=markup)
+        else:
+            bot.send_message(message.chat.id, "Admin kanallar ro'yxati yo'q.")
+        return
+
+    text = (message.text or "").strip()
+    if text.startswith("http://") or text.startswith("https://"):
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("📹 720p", callback_data=f"dl|video|720|{text}"),
+            types.InlineKeyboardButton("📹 360p", callback_data=f"dl|video|360|{text}")
+        )
+        markup.add(types.InlineKeyboardButton("🎵 MP3", callback_data=f"dl|audio|mp3|{text}"))
+        bot.send_message(message.chat.id, "Formatni tanlang:", reply_markup=markup)
+    else:
+        msg = bot.send_message(message.chat.id, "🔍 Qidirilmoqda...")
+        try:
+            tracks = search_music(text)
+            if not tracks:
+                bot.edit_message_text("Topilmadi 😕", message.chat.id, msg.message_id)
+                return
+            markup = types.InlineKeyboardMarkup()
+            for t in tracks:
+                markup.add(types.InlineKeyboardButton(f"🎵 {t['title']}", callback_data=f"music|{t['id']}"))
+            bot.edit_message_text("Topilganlar:", message.chat.id, msg.message_id, reply_markup=markup)
+        except Exception:
+            logger.exception("search qatorida xatolik")
+            try:
+                bot.edit_message_text("Qidirishda xatolik yuz berdi", message.chat.id, msg.message_id)
+            except Exception:
+                bot.send_message(message.chat.id, "Qidirishda xatolik yuz berdi")
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    data = call.data.split("|", 3) if call.data else []
+    if not data:
+        bot.answer_callback_query(call.id, "Noma'lum so'rov")
+        return
+
+    if data[0] == "add_ch_type" and len(data) >= 2:
+        ch_type = data[1]
+        admin_states[user_id] = f"WAITING_FOR_CHANNEL_{ch_type}"
+        bot.send_message(call.message.chat.id, "Kanal username'ini yuboring (masalan: `@kanal_username`)", parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+        return
+
+    if data[0] == "del_ch" and len(data) >= 2:
+        ch_id = data[1]
+        delete_channel_db(ch_id)
+        bot.send_message(call.message.chat.id, f"✅ `{ch_id}` o'chirildi!", parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+        return
+
+    is_vip = is_user_subscribed(user_id, "vip")
+    max_limit = LIMIT_VIP if is_vip else LIMIT_STANDARD
+
+    try:
+        if data[0] == "music" and len(data) >= 2:
+            video_id = data[1]
+            url = f"https://www.youtube.com/watch?v={video_id}"
+            bot.answer_callback_query(call.id, "Yuklanmoqda...")
+            try:
+                file_path, size = download_media(url, is_audio=True)
+                if size > max_limit and max_limit > 0:
+                    bot.send_message(call.message.chat.id, f"⚠️ Fayl hajmi juda katta ({size // (1024*1024)} MB). Cheklov: {max_limit // (1024*1024)} MB")
+                else:
+                    with open(file_path, "rb") as audio:
+                        bot.send_audio(call.message.chat.id, audio)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                logger.exception("music yuklash xatosi")
+                bot.send_message(call.message.chat.id, "Yuklashda xatolik yuz berdi.")
+            return
+
+        if data[0] == "dl" and len(data) >= 4:
+            mode, fmt, url = data[1], data[2], data[3]
+            bot.answer_callback_query(call.id, "Yuklanmoqda...")
+            is_audio = (mode == "audio")
+            try:
+                file_path, size = download_media(url, is_audio=is_audio, format_id=(fmt if not is_audio else None))
+                if size > max_limit and max_limit > 0:
+                    bot.send_message(call.message.chat.id, f"⚠️ Fayl hajmi juda katta ({size // (1024*1024)} MB). Cheklov: {max_limit // (1024*1024)} MB")
+                else:
+                    with open(file_path, "rb") as f:
+                        if is_audio:
+                            bot.send_audio(call.message.chat.id, f)
+                        else:
+                            bot.send_video(call.message.chat.id, f)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                logger.exception("dl yuklash xatosi")
+                bot.send_message(call.message.chat.id, "Videoni yuklash imkoni bo'lmadi.")
+            return
+
+        bot.answer_callback_query(call.id, "Noma'lum tugma")
+    except Exception:
+        logger.exception("callback_handler umumiy xatolik")
+        try:
+            bot.send_message(call.message.chat.id, "Ichki xatolik yuz berdi.")
+        except Exception:
+            pass
+
+# ========== Webhook & Flask endpoint ==========
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook_receive():
+    try:
+        json_string = request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return "OK", 200
+    except Exception:
+        logger.exception("webhook_receive xatolik")
+        return "ERR", 500
+
+@app.route("/", methods=["GET"])
+def index():
+    if EXTERNAL_URL:
+        init_webhook()
+        return "Bot va Webhook faol!", 200
+    return "Bot faol (Polling rejimida yoqilgan)", 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
+
+def init_webhook():
+    if not EXTERNAL_URL:
+        return False
+    webhook_url = f"{EXTERNAL_URL.rstrip('/')}/{BOT_TOKEN}"
+    try:
+        bot.remove_webhook()
+        bot.set_webhook(url=webhook_url)
+        logger.info("Webhook muvaffaqiyatli o'rnatildi: %s", webhook_url)
+        return True
+    except Exception:
+        logger.exception("Webhook o'rnatishda xatolik")
+        return False
+
+# ========== Ishga tushirish (Run) ==========
+if __name__ == "__main__":
+    if EXTERNAL_URL:
+        init_webhook()
+        app.run(host="0.0.0.0", port=PORT)
+    else:
+        logger.info("EXTERNAL_URL topilmadi. Bot Polling rejimida ishga tushmoqda...")
+        bot.remove_webhook()
+        bot.infinity_polling()
